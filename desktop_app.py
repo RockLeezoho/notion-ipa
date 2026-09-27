@@ -7,6 +7,7 @@ import requests
 import time
 import sys
 import socket
+import shutil
 
 
 # =========================================================
@@ -16,8 +17,15 @@ import socket
 HOST = "127.0.0.1"
 PORT = 8000
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SERVER_LOG_FILE = os.path.join(BASE_DIR, "notion_ipa.log")
+
 NGROK_DOMAIN = os.getenv("NGROK_DOMAIN")
 NGROK_REGION = os.getenv("NGROK_REGION")
+
+# Resolve the exact ngrok executable visible to this Python process.
+# This avoids PATH differences between CMD, Git Bash, and the GUI process.
+NGROK_EXE = shutil.which("ngrok")
 
 UVICORN_COMMAND = [
     sys.executable,
@@ -32,16 +40,22 @@ UVICORN_COMMAND = [
 
 
 def build_ngrok_command():
-    """Return the ngrok command using a stable domain when configured."""
+    """Build the ngrok command using the executable visible to Python."""
 
-    command = ["ngrok", "http"]
+    if not NGROK_EXE:
+        raise FileNotFoundError(
+            "ngrok.exe was not found in this Python process PATH. "
+            "Run `where ngrok` and verify the GUI is started from the "
+            "same environment."
+        )
+
+    command = [NGROK_EXE, "http"]
 
     if NGROK_REGION:
         command.extend(["--region", NGROK_REGION])
 
     if NGROK_DOMAIN:
-        command.extend(["--domain", NGROK_DOMAIN, str(PORT)])
-        return command
+        command.extend(["--domain", NGROK_DOMAIN])
 
     command.append(str(PORT))
     return command
@@ -851,61 +865,81 @@ class DesktopApp:
             "Starting ngrok tunnel..."
         )
 
-        try:
+        public_url = self.get_ngrok_url()
 
-            ngrok_command = build_ngrok_command()
-
+        if public_url:
             self.log(
-                f"Starting ngrok with command: {' '.join(ngrok_command)}"
+                f"Using existing ngrok tunnel: {public_url}"
             )
 
-            self.ngrok_process = subprocess.Popen(
-                ngrok_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                creationflags=CREATE_NO_WINDOW
-            )
+        else:
+            try:
 
-            self.ngrok_started_by_app = True
+                ngrok_command = build_ngrok_command()
 
-            threading.Thread(
-                target=self.read_process_output,
-                args=(
-                    self.ngrok_process,
-                    "ngrok"
-                ),
-                daemon=True
-            ).start()
+                self.log(
+                    f"ngrok executable: {NGROK_EXE}"
+                )
+                self.log(
+                    f"Starting ngrok with command: {' '.join(ngrok_command)}"
+                )
 
-        except Exception as e:
+                self.ngrok_process = subprocess.Popen(
+                    ngrok_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    creationflags=CREATE_NO_WINDOW
+                )
 
-            self.log(
-                f"Failed to start ngrok: {e}"
-            )
+                self.ngrok_started_by_app = True
 
-            self.start_button.configure(
-                state="normal"
-            )
+                threading.Thread(
+                    target=self.read_process_output,
+                    args=(
+                        self.ngrok_process,
+                        "ngrok"
+                    ),
+                    daemon=True
+                ).start()
 
-            return
+            except Exception as e:
+
+                self.log(
+                    f"Failed to start ngrok: {e}"
+                )
+
+                self.start_button.configure(
+                    state="normal"
+                )
+
+                return
 
 
         # -------------------------------------------------
         # Wait for ngrok URL
         # -------------------------------------------------
 
-        public_url = None
+        if not public_url:
+            for _ in range(30):
 
-        for _ in range(30):
+                time.sleep(0.5)
 
-            time.sleep(0.5)
+                if (
+                    self.ngrok_process
+                    and self.ngrok_process.poll() is not None
+                ):
+                    self.log(
+                        f"ngrok exited with code "
+                        f"{self.ngrok_process.returncode}."
+                    )
+                    break
 
-            public_url = self.get_ngrok_url()
+                public_url = self.get_ngrok_url()
 
-            if public_url:
-                break
+                if public_url:
+                    break
 
         if public_url:
 
@@ -1003,46 +1037,73 @@ class DesktopApp:
     def get_ngrok_url(self):
 
         try:
-
             response = requests.get(
                 NGROK_API,
                 timeout=1
             )
+            response.raise_for_status()
 
             data = response.json()
-
-            tunnels = data.get(
-                "tunnels",
-                []
-            )
+            tunnels = data.get("tunnels", [])
 
             preferred = None
 
             for tunnel in tunnels:
+                public_url = tunnel.get("public_url")
 
-                public_url = tunnel.get(
-                    "public_url"
-                )
-
-                if not public_url or not public_url.startswith(
-                    "https://"
-                ):
+                if not public_url or not public_url.startswith("https://"):
                     continue
 
-                if NGROK_DOMAIN and public_url.endswith(
-                    f"{NGROK_DOMAIN}"
-                ):
-                    return public_url
+                public_url = public_url.rstrip("/")
 
-                if not preferred:
+                if NGROK_DOMAIN:
+                    configured_domain = NGROK_DOMAIN.replace(
+                        "https://",
+                        ""
+                    ).rstrip("/")
+
+                    if public_url.endswith(configured_domain):
+                        return public_url
+
+                if preferred is None:
                     preferred = public_url
 
             return preferred
 
-        except Exception:
-            pass
+        except (requests.RequestException, ValueError, OSError):
+            return None
 
-        return None
+
+    # =====================================================
+    # WEBHOOK TEST
+    # =====================================================
+
+    def test_local_webhook(self):
+        """Test the FastAPI webhook without involving Notion/ngrok."""
+
+        try:
+            response = requests.post(
+                f"http://{HOST}:{PORT}/webhook/notion",
+                json={
+                    "test": True,
+                    "source": "desktop_app"
+                },
+                timeout=5
+            )
+
+            self.log(
+                f"Local webhook test: HTTP {response.status_code}"
+            )
+
+            if response.text:
+                self.log(
+                    f"Local webhook response: {response.text[:300]}"
+                )
+
+        except requests.RequestException as e:
+            self.log(
+                f"Local webhook test failed: {e}"
+            )
 
 
     # =====================================================
@@ -1202,6 +1263,10 @@ class DesktopApp:
                     "Inactive",
                     RED
                 )
+
+                if self.webhook_url:
+                    self.url_entry.delete(0, "end")
+                    self.webhook_url = ""
 
         except Exception:
             pass

@@ -412,11 +412,11 @@ def get_data_source_properties():
     Get the list of Data Source properties from Notion.
     """
 
-    validate_config()
+    config = validate_config()
 
     url = (
         f"{BASE_URL}/data_sources/"
-        f"{NOTION_DATA_SOURCE_ID}"
+        f"{config['data_source_id']}"
     )
 
     data = notion_get(url)

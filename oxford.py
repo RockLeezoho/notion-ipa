@@ -1,6 +1,7 @@
 import re
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
 from urllib.parse import quote
@@ -132,153 +133,55 @@ def fetch_url(url: str):
     - After MAX_RETRIES -> network_error
     """
 
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-
             response = requests.get(
                 url,
                 headers=HEADERS,
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
-
-            # -------------------------------------------------
-            # Page not found
-            # -------------------------------------------------
 
             if response.status_code == 404:
-
-                return {
-                    "status": STATUS_NOT_FOUND,
-                    "soup": None
-                }
-
-            # -------------------------------------------------
-            # Other HTTP status codes
-            # -------------------------------------------------
+                return {"status": STATUS_NOT_FOUND, "soup": None}
 
             response.raise_for_status()
-
-            # -------------------------------------------------
-            # Success
-            # -------------------------------------------------
-
             return {
                 "status": STATUS_SUCCESS,
-                "soup": BeautifulSoup(
-                    response.text,
-                    "html.parser"
-                )
+                "soup": BeautifulSoup(response.text, "html.parser"),
             }
 
-        # -----------------------------------------------------
-        # Timeout
-        # -----------------------------------------------------
-
         except requests.exceptions.Timeout:
-
-            print(
-                f"Oxford timeout "
-                f"(attempt {attempt}/{MAX_RETRIES})"
-            )
-
-        # -----------------------------------------------------
-        # Connection error
-        # -----------------------------------------------------
-
+            print(f"Oxford timeout (attempt {attempt}/{MAX_RETRIES})")
         except requests.exceptions.ConnectionError:
-
-            print(
-                f"Oxford connection error "
-                f"(attempt {attempt}/{MAX_RETRIES})"
-            )
-
-        # -----------------------------------------------------
-        # HTTP / request error
-        # -----------------------------------------------------
-
-        except requests.exceptions.RequestException as e:
-
+            print(f"Oxford connection error (attempt {attempt}/{MAX_RETRIES})")
+        except requests.exceptions.RequestException as error:
             print(
                 f"Oxford request error "
-                f"(attempt {attempt}/{MAX_RETRIES}): {e}"
+                f"(attempt {attempt}/{MAX_RETRIES}): {error}"
             )
-
-        # -----------------------------------------------------
-        # Retry
-        # -----------------------------------------------------
 
         if attempt < MAX_RETRIES:
-
             delay = RETRY_DELAY * attempt
-
-            print(
-                f"Retrying Oxford in {delay:.1f}s..."
-            )
-
+            print(f"Retrying Oxford in {delay:.1f}s...")
             time.sleep(delay)
 
-    # ---------------------------------------------------------
-    # Request failed after MAX_RETRIES
-    # ---------------------------------------------------------
-
-    print(
-        f"Oxford request failed after "
-        f"{MAX_RETRIES} attempts."
-    )
-
-    return {
-        "status": STATUS_NETWORK_ERROR,
-        "soup": None
-    }
-
-
-# =========================================================
-# BUILD CANDIDATE URLS
-# =========================================================
+    print(f"Oxford request failed after {MAX_RETRIES} attempts.")
+    return {"status": STATUS_NETWORK_ERROR, "soup": None}
 
 def find_candidate_urls(word: str):
-    """
-    Build a list of possible Oxford entry URLs.
-
-    Example for "initiate":
-
-        /definition/english/initiate
-        /definition/english/initiate_1
-        /definition/english/initiate_2
-        ...
-    """
+    """Build possible Oxford entry URLs for a word."""
 
     word = word.strip().lower()
-
     if not word:
         return []
 
-    word_encoded = quote(
-        word,
-        safe=""
-    )
+    word_encoded = quote(word, safe="")
+    base_url = f"{OXFORD_BASE_URL}/definition/english/{word_encoded}"
 
-    candidates = []
-
-    # Entry without suffix
-    candidates.append(
-        f"{OXFORD_BASE_URL}/definition/english/"
-        f"{word_encoded}"
-    )
-
-    # initiate_1, initiate_2, ...
-    for number in range(1, 11):
-
-        candidates.append(
-            f"{OXFORD_BASE_URL}/definition/english/"
-            f"{word_encoded}_{number}"
-        )
-
-    return candidates
+    return [base_url] + [
+        f"{base_url}_{number}"
+        for number in range(1, 11)
+    ]
 
 
 # =========================================================
@@ -609,161 +512,70 @@ def find_entry_by_pos(
     """
 
     word = word.strip()
-
     if not word:
+        return {"status": STATUS_NOT_FOUND}
 
-        return {
-            "status": STATUS_NOT_FOUND
-        }
-
-    target_pos = normalize_pos(
-        target_pos
-    )
-
+    target_pos = normalize_pos(target_pos)
     if not target_pos:
+        return {"status": STATUS_NOT_FOUND}
 
-        return {
-            "status": STATUS_NOT_FOUND
-        }
-
-    candidates = find_candidate_urls(
-        word
-    )
-
-    # -----------------------------------------------------
-    # Track whether any network error occurred
-    # -----------------------------------------------------
-
+    candidates = find_candidate_urls(word)
     had_network_error = False
+    executor = ThreadPoolExecutor(max_workers=min(8, len(candidates)))
+    futures = {
+        executor.submit(fetch_url, url): url
+        for url in candidates
+    }
 
-    # -----------------------------------------------------
-    # Iterate through candidate URLs
-    # -----------------------------------------------------
+    try:
+        for future in as_completed(futures):
+            url = futures[future]
 
-    for url in candidates:
+            try:
+                result = future.result()
+            except Exception as error:
+                print(f"Oxford candidate error for {url}: {error}")
+                had_network_error = True
+                continue
 
-        result = fetch_url(
-            url
-        )
+            status = result["status"]
+            if status == STATUS_NETWORK_ERROR:
+                had_network_error = True
+                continue
+            if status == STATUS_NOT_FOUND:
+                continue
 
-        status = result["status"]
+            soup = result["soup"]
+            if not soup or not is_word_match(soup, word):
+                continue
 
-        # -------------------------------------------------
-        # Network error
-        # -------------------------------------------------
+            current_pos = extract_pos(soup)
+            if current_pos != target_pos:
+                continue
 
-        if status == STATUS_NETWORK_ERROR:
+            british = get_british_ipa(soup)
+            american = get_american_ipa(soup)
+            if not british and not american:
+                continue
 
-            had_network_error = True
-
-            continue
-
-        # -------------------------------------------------
-        # URL not found
-        # -------------------------------------------------
-
-        if status == STATUS_NOT_FOUND:
-
-            continue
-
-        # -------------------------------------------------
-        # Success
-        # -------------------------------------------------
-
-        soup = result["soup"]
-
-        if not soup:
-            continue
-
-        # -------------------------------------------------
-        # Check word match
-        # -------------------------------------------------
-
-        if not is_word_match(
-            soup,
-            word
-        ):
-            continue
-
-        # -------------------------------------------------
-        # Extract POS
-        # -------------------------------------------------
-
-        current_pos = extract_pos(
-            soup
-        )
-
-        if current_pos != target_pos:
-            continue
-
-        # -------------------------------------------------
-        # Extract IPA
-        # -------------------------------------------------
-
-        british = get_british_ipa(
-            soup
-        )
-
-        american = get_american_ipa(
-            soup
-        )
-
-        # Skip entries without IPA
-        if not british and not american:
-            continue
-
-        # -------------------------------------------------
-        # Extract audio
-        # -------------------------------------------------
-
-        british_audio = get_british_audio(
-            soup
-        )
-
-        american_audio = get_american_audio(
-            soup
-        )
-
-        # -------------------------------------------------
-        # Return SUCCESS
-        # -------------------------------------------------
-
-        return {
-            "status": STATUS_SUCCESS,
-
-            "word": word,
-            "pos": current_pos,
-            "url": url,
-
-            "british": british,
-            "american": american,
-
-            "ipa": format_ipa(
-                british,
-                american
-            ),
-
-            "british_audio": british_audio,
-            "american_audio": american_audio,
-        }
-
-    # -----------------------------------------------------
-    # If all candidates failed due to network errors
-    # -----------------------------------------------------
+            return {
+                "status": STATUS_SUCCESS,
+                "word": word,
+                "pos": current_pos,
+                "url": url,
+                "british": british,
+                "american": american,
+                "ipa": format_ipa(british, american),
+                "british_audio": get_british_audio(soup),
+                "american_audio": get_american_audio(soup),
+            }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     if had_network_error:
+        return {"status": STATUS_NETWORK_ERROR}
 
-        return {
-            "status": STATUS_NETWORK_ERROR
-        }
-
-    # -----------------------------------------------------
-    # Word + POS not found
-    # -----------------------------------------------------
-
-    return {
-        "status": STATUS_NOT_FOUND
-    }
+    return {"status": STATUS_NOT_FOUND}
 
 
 # =========================================================
@@ -774,31 +586,9 @@ def get_ipa(
     word: str,
     pos: str
 ) -> str | None:
-    """
-    Simple function to get IPA.
+    """Return the IPA string for a word and part of speech."""
 
-    Example:
-
-        get_ipa("initiate", "v")
-
-    returns:
-
-        [BrE] /ɪˈnɪʃieɪt/ [AmE] /ɪˈnɪʃieɪt/
-
-    If not found:
-        return None
-
-    If a network error occurs:
-        return None
-    """
-
-    entry = find_entry_by_pos(
-        word,
-        pos
-    )
-
-    if not entry:
-        return None
+    entry = find_entry_by_pos(word, pos)
 
     if entry["status"] != STATUS_SUCCESS:
         return None

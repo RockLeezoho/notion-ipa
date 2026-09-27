@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import threading
 import traceback
 
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
@@ -46,6 +47,13 @@ WEBHOOK_SECRET = os.getenv(
     "NOTION_WEBHOOK_SECRET"
 )
 
+LOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "notion_ipa.log"
+)
+
+LOG_LOCK = threading.Lock()
+
 
 # =========================================================
 # FASTAPI
@@ -76,9 +84,18 @@ def log(message=""):
     Print a log message safely on Windows.
     """
 
+    text = str(message)
+
+    try:
+        with LOG_LOCK:
+            with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+                log_file.write(text + "\n")
+    except Exception:
+        pass
+
     try:
         print(
-            message,
+            text,
             flush=True
         )
 
@@ -206,6 +223,7 @@ def process_page(
     log("=" * 60)
     log("[START] Processing page")
     log(f"Page ID : {page_id}")
+    log(f"[INPUT] Webhook Word={word!r}, POS={pos!r}")
 
     try:
 
@@ -223,6 +241,11 @@ def process_page(
 
         current_pos = page_data.get(
             "pos"
+        )
+
+        log(
+            f"[NOTION] Current page Word={current_word!r}, "
+            f"POS={current_pos!r}"
         )
 
         # Prefer values read directly from Notion.
@@ -481,6 +504,10 @@ async def notion_webhook(
         "[WEBHOOK] Received webhook from Notion."
     )
 
+    log(
+        f"[WEBHOOK] Payload keys: {sorted(payload.keys())}"
+    )
+
     # -----------------------------------------------------
     # Verify secret
     # -----------------------------------------------------
@@ -539,6 +566,11 @@ async def notion_webhook(
         f"[WEBHOOK] POS: {pos}"
     )
 
+    log(
+        f"[WEBHOOK] Properties: "
+        f"{sorted(payload.get('data', {}).get('properties', {}).keys())}"
+    )
+
     # -----------------------------------------------------
     # Validate page ID
     # -----------------------------------------------------
@@ -563,6 +595,11 @@ async def notion_webhook(
         page_id,
         word,
         pos
+    )
+
+    log(
+        f"[WEBHOOK] Queued page_id={page_id}, "
+        f"word={word!r}, pos={pos!r}"
     )
 
     log(
